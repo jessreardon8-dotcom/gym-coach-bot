@@ -444,7 +444,24 @@ def send_evening_checkin():
         except Exception as e:
             print(f"Evening check-in error for {chat_id}: {e}")
 
+def send_morning_reminder():
+    for chat_id in list(known_users):
+        profile = user_profiles.get(chat_id, {})
+        name = profile.get("name", "")
+        greeting = f"{name}! " if name else ""
+        try:
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=80,
+                system="You are a savage but caring drill sergeant gym coach sending a 7am wake-up text. Remind them to take their pills and chlorophyll. Be aggressive and motivational. 1-2 sentences max.",
+                messages=[{"role": "user", "content": f"Send a morning reminder to take pills and chlorophyll. Address them as {greeting}"}]
+            )
+            send_telegram(chat_id, message.content[0].text)
+        except Exception as e:
+            print(f"Morning reminder error for {chat_id}: {e}")
+
 # Schedule jobs (UTC — matches UK/GMT in winter, 1hr early in BST)
+schedule.every().day.at("07:00").do(send_morning_reminder)
 schedule.every().day.at("09:00").do(send_daily_checkin)
 schedule.every().day.at("20:00").do(send_evening_checkin)
 schedule.every().day.at("00:00").do(reset_all_daily_stats)
