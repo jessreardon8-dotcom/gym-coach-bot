@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MAX_HISTORY = 10
-DATA_FILE = "users.json"
+DATA_FILE = "data.json"
 CALORIE_GOAL = 1350
 WATER_GOAL_ML = 2000
 
@@ -31,23 +31,28 @@ def load_data():
                 lambda: {"name": None, "goal": None, "onboarded": False, "workouts": [], "daily": {}},
                 {int(k): v for k, v in data.get("profiles", {}).items()}
             )
-            return known, profiles
+            history = defaultdict(list, {int(k): v for k, v in data.get("conversation_history", {}).items()})
+            return known, profiles, history
         except Exception as e:
             print(f"Load error: {e}")
-    return set(), defaultdict(lambda: {"name": None, "goal": None, "onboarded": False, "workouts": [], "daily": {}})
+    return (
+        set(),
+        defaultdict(lambda: {"name": None, "goal": None, "onboarded": False, "workouts": [], "daily": {}}),
+        defaultdict(list),
+    )
 
 def save_data():
     try:
         with open(DATA_FILE, "w") as f:
             json.dump({
                 "known_users": list(known_users),
-                "profiles": {str(k): v for k, v in user_profiles.items()}
+                "profiles": {str(k): v for k, v in user_profiles.items()},
+                "conversation_history": {str(k): v for k, v in conversation_history.items()},
             }, f)
     except Exception as e:
         print(f"Save error: {e}")
 
-known_users, user_profiles = load_data()
-conversation_history = defaultdict(list)
+known_users, user_profiles, conversation_history = load_data()
 
 # --- Daily tracking ---
 
@@ -334,6 +339,8 @@ def get_ai_reply(chat_id, user_text):
 
         if len(history) > MAX_HISTORY:
             conversation_history[chat_id] = history[-MAX_HISTORY:]
+
+        save_data()
 
         if not profile.get("name") or not profile.get("goal"):
             extract_profile(chat_id, history)
