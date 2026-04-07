@@ -1,8 +1,4 @@
 import os
-import sys
-import types
-sys.modules['imghdr'] = types.ModuleType('imghdr')
-
 import threading
 import anthropic
 import requests
