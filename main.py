@@ -1,27 +1,62 @@
 import os
+import sys
+import types
+sys.modules['imghdr'] = types.ModuleType('imghdr')
+
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import anthropic
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+import requests
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 def get_ai_reply(user_text):
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=256,
-        system="You are a savage but supportive gym coach. Reply like a real text message — short, punchy, no fluff. Keep it under 3 sentences.",
-        messages=[{"role": "user", "content": user_text}]
-    )
-    return response.content[0].text
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system="You are a savage but supportive gym coach. Reply like a real text message - short, punchy, tough love but you care. Max 2-3 sentences.",
+            messages=[{"role": "user", "content": user_text}]
+        )
+        return message.content[0].text
+    except Exception as e:
+        return f"something went wrong: {str(e)}"
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    reply = get_ai_reply(user_text)
-    await update.message.reply_text(reply)
+def handle_update(update):
+    try:
+        message = update.get("message", {})
+        chat_id = message.get("chat", {}).get("id")
+        text = message.get("text", "")
+        if chat_id and text and not text.startswith("/"):
+            reply = get_ai_reply(text)
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": reply}
+            )
+    except Exception as e:
+        print(f"Error handling update: {e}")
+
+def poll_telegram():
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 30}
+            if offset:
+                params["offset"] = offset
+            response = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params=params,
+                timeout=35
+            )
+            data = response.json()
+            for update in data.get("result", []):
+                handle_update(update)
+                offset = update["update_id"] + 1
+        except Exception as e:
+            print(f"Polling error: {e}")
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -37,9 +72,5 @@ def run_health_server():
     server.serve_forever()
 
 threading.Thread(target=run_health_server, daemon=True).start()
-
-app = Application.builder().token(TELEGRAM_TOKEN).build()
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
 print("Savage AI Gym Coach is running...")
-app.run_polling()
+poll_telegram()
