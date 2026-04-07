@@ -291,24 +291,35 @@ def handle_update(update):
     except Exception as e:
         print(f"Error handling update: {e}")
 
+_polling_lock = threading.Lock()
+
 def poll_telegram():
+    if not _polling_lock.acquire(blocking=False):
+        print("Polling loop already running — refusing to start a second one.")
+        return
+
+    print("Polling loop started.")
     offset = None
-    while True:
-        try:
-            params = {"timeout": 30}
-            if offset:
-                params["offset"] = offset
-            response = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
-                params=params,
-                timeout=35
-            )
-            data = response.json()
-            for update in data.get("result", []):
-                handle_update(update)
-                offset = update["update_id"] + 1
-        except Exception as e:
-            print(f"Polling error: {e}")
+    try:
+        while True:
+            try:
+                params = {"timeout": 30}
+                if offset:
+                    params["offset"] = offset
+                response = requests.get(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                    params=params,
+                    timeout=35
+                )
+                data = response.json()
+                for update in data.get("result", []):
+                    handle_update(update)
+                    offset = update["update_id"] + 1
+            except Exception as e:
+                print(f"Polling error: {e}")
+                time.sleep(5)
+    finally:
+        _polling_lock.release()
 
 # --- Health server ---
 
