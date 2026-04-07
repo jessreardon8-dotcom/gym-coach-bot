@@ -1,7 +1,9 @@
 import os
+import re
 import json
 import threading
 import time
+import datetime
 from collections import defaultdict
 import schedule
 import anthropic
@@ -12,6 +14,8 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 MAX_HISTORY = 10
 DATA_FILE = "users.json"
+CALORIE_GOAL = 1350
+WATER_GOAL_ML = 2000
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -24,13 +28,13 @@ def load_data():
                 data = json.load(f)
             known = set(data.get("known_users", []))
             profiles = defaultdict(
-                lambda: {"name": None, "goal": None, "onboarded": False, "workouts": []},
+                lambda: {"name": None, "goal": None, "onboarded": False, "workouts": [], "daily": {}},
                 {int(k): v for k, v in data.get("profiles", {}).items()}
             )
             return known, profiles
         except Exception as e:
             print(f"Load error: {e}")
-    return set(), defaultdict(lambda: {"name": None, "goal": None, "onboarded": False, "workouts": []})
+    return set(), defaultdict(lambda: {"name": None, "goal": None, "onboarded": False, "workouts": [], "daily": {}})
 
 def save_data():
     try:
@@ -45,6 +49,172 @@ def save_data():
 known_users, user_profiles = load_data()
 conversation_history = defaultdict(list)
 
+# --- Daily tracking ---
+
+def get_uk_date():
+    """Current date in UTC (≈ UK time; 1hr off during BST)."""
+    return datetime.datetime.utcnow().date().isoformat()
+
+def get_daily(chat_id):
+    """Return today's daily stats for a user, resetting if it's a new day."""
+    profile = user_profiles[chat_id]
+    today = get_uk_date()
+    if not profile.get("daily") or profile["daily"].get("date") != today:
+        profile["daily"] = {
+            "date": today,
+            "calories": 0,
+            "water_ml": 0,
+            "pills": False,
+            "chlorophyll": False,
+        }
+        save_data()
+    return profile["daily"]
+
+def reset_all_daily_stats():
+    today = get_uk_date()
+    for chat_id in list(known_users):
+        user_profiles[chat_id]["daily"] = {
+            "date": today,
+            "calories": 0,
+            "water_ml": 0,
+            "pills": False,
+            "chlorophyll": False,
+        }
+    save_data()
+    print("Daily stats reset for all users.")
+
+# --- Tracking detection ---
+
+TRACKING_KEYWORDS = [
+    "ate", "eaten", "eat", "eating", "had", "breakfast", "lunch", "dinner",
+    "snack", "meal", "coffee", "tea", "drank", "drink", "food", "calorie",
+    "burger", "pizza", "sandwich", "salad", "rice", "pasta", "chicken", "fish",
+    "fruit", "veg", "protein", "shake", "bar", "biscuit", "cake", "chocolate",
+    "water", "ml", "litre", "liter", "glass", "bottle", "hydrat",
+    "pill", "tablet", "medication", "supplement", "vitamin", "chlorophyll",
+]
+
+def needs_tracking_check(text):
+    lower = text.lower()
+    return any(kw in lower for kw in TRACKING_KEYWORDS)
+
+def parse_int(s):
+    m = re.search(r'\d+', s)
+    return int(m.group()) if m else 0
+
+def detect_tracking(text):
+    """Ask Claude to extract any food/water/pills/chlorophyll from a message."""
+    prompt = f"""Analyze this message and extract health tracking info. Reply ONLY in this exact format, no other text:
+
+CALORIES: <estimated calories as integer, 0 if no food mentioned>
+WATER_ML: <water in ml as integer, 0 if no water mentioned. 1 small glass=200ml, 1 glass=250ml, 1 large glass=350ml, 1 bottle=500ml, 1 litre=1000ml>
+PILLS: <yes or no — only if they explicitly say they took their pills or medication>
+CHLOROPHYLL: <yes or no — only if they explicitly say they took chlorophyll>
+
+Rules:
+- CALORIES: only estimate if they describe eating specific food. Be accurate. 0 if no food.
+- WATER_ML: only if they mention drinking water specifically. 0 for other drinks.
+- PILLS/CHLOROPHYLL: must be explicit — "took my pills", "had my chlorophyll", etc.
+
+Message: {text}"""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = {"calories": 0, "water_ml": 0, "pills": False, "chlorophyll": False}
+        for line in response.content[0].text.strip().splitlines():
+            if line.startswith("CALORIES:"):
+                result["calories"] = parse_int(line.split(":", 1)[1])
+            elif line.startswith("WATER_ML:"):
+                result["water_ml"] = parse_int(line.split(":", 1)[1])
+            elif line.startswith("PILLS:"):
+                result["pills"] = "yes" in line.lower()
+            elif line.startswith("CHLOROPHYLL:"):
+                result["chlorophyll"] = "yes" in line.lower()
+        return result
+    except Exception:
+        return {"calories": 0, "water_ml": 0, "pills": False, "chlorophyll": False}
+
+def apply_tracking(chat_id, text):
+    """Run tracking detection and update daily stats. Returns a context string for the AI."""
+    if not needs_tracking_check(text):
+        return None
+
+    tracking = detect_tracking(text)
+    daily = get_daily(chat_id)
+    updates = []
+    changed = False
+
+    if tracking["calories"] > 0:
+        daily["calories"] += tracking["calories"]
+        remaining = max(0, CALORIE_GOAL - daily["calories"])
+        updates.append(f"Logged {tracking['calories']} cal — total {daily['calories']}/{CALORIE_GOAL} ({remaining} remaining)")
+        changed = True
+
+    if tracking["water_ml"] > 0:
+        daily["water_ml"] += tracking["water_ml"]
+        remaining_ml = max(0, WATER_GOAL_ML - daily["water_ml"])
+        updates.append(f"Logged {tracking['water_ml']}ml water — total {daily['water_ml']}ml/{WATER_GOAL_ML}ml ({remaining_ml}ml to go)")
+        changed = True
+
+    if tracking["pills"] and not daily["pills"]:
+        daily["pills"] = True
+        updates.append("Pills logged ✅")
+        changed = True
+
+    if tracking["chlorophyll"] and not daily["chlorophyll"]:
+        daily["chlorophyll"] = True
+        updates.append("Chlorophyll logged ✅")
+        changed = True
+
+    if changed:
+        save_data()
+
+    return " | ".join(updates) if updates else None
+
+# --- Daily summary ---
+
+def format_daily_summary(chat_id, include_savage_comment=False):
+    daily = get_daily(chat_id)
+    profile = user_profiles.get(chat_id, {})
+    name = profile.get("name", "")
+
+    cal_remaining = max(0, CALORIE_GOAL - daily["calories"])
+    water_pct = min(100, int(daily["water_ml"] / WATER_GOAL_ML * 100))
+    water_remaining = max(0, WATER_GOAL_ML - daily["water_ml"])
+
+    lines = [
+        "📊 TODAY'S SUMMARY",
+        "",
+        f"🔥 Calories: {daily['calories']} / {CALORIE_GOAL} — {cal_remaining} left",
+        f"💧 Water: {daily['water_ml']}ml / {WATER_GOAL_ML}ml ({water_pct}%{' — ' + str(water_remaining) + 'ml to go' if water_remaining > 0 else ' — DONE ✅'})",
+        f"💊 Pills: {'✅' if daily['pills'] else '❌ not logged'}",
+        f"🌿 Chlorophyll: {'✅' if daily['chlorophyll'] else '❌ not logged'}",
+    ]
+
+    if include_savage_comment:
+        try:
+            prompt = f"""You are a savage drill sergeant gym coach. Write ONE punchy sentence (max 20 words) reacting to this person's day. Be specific, brutal if they slacked, hyped if they killed it. Use their name if provided.
+
+Name: {name or 'soldier'}
+Calories: {daily['calories']}/{CALORIE_GOAL}
+Water: {daily['water_ml']}ml/{WATER_GOAL_ML}ml
+Pills taken: {daily['pills']}
+Chlorophyll taken: {daily['chlorophyll']}"""
+            response = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=60,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            lines.append("")
+            lines.append(response.content[0].text.strip())
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
 # --- System prompts ---
 
 SYSTEM_PROMPT = """You are an elite personal trainer and drill sergeant rolled into one. You text your clients like a real coach — no fluff, no essays, just fire.
@@ -58,20 +228,13 @@ YOUR PERSONALITY:
 - Never use bullet points or numbered lists
 - Occasional all-caps for emphasis is fine
 
-WHAT YOU TRACK AND USE:
-- Their name — use it often
-- Their goal — reference it constantly, tie everything back to it
-- Their workouts: exercises, weights, reps, sets they mention — bring these up later
-- Their patterns: are they consistent? Skipping days? Making progress?
-- Their excuses — remember them and call it out if they repeat
-
 COACHING RULES:
-- If they're tired: acknowledge it for one second, then push through
-- If they skipped: don't let it slide, make them commit to making it up
+- Reference their name, goal, and tracked stats when relevant
+- If they logged food: acknowledge it and comment on their calories remaining
+- If they logged water: acknowledge it and push them to hit 2L
+- If pills/chlorophyll not taken by evening: remind them
 - If they hit a PR or crushed a workout: go CRAZY, hype them up
-- If they mention weight, reps, or exercises: log it mentally and reference it next time
-- Never give generic advice — always tie it to what YOU know about THEM
-- If they're losing motivation, remind them why they started"""
+- Call out excuses and redirect to action immediately"""
 
 ONBOARDING_PROMPT = """You are a tough but invested gym coach texting a new client for the first time. Ask their name and their #1 fitness goal in one short punchy message. Be direct and exciting — make them want to answer. One message only, 1-2 sentences."""
 
@@ -88,19 +251,32 @@ def extract_workout_data(text):
     lower = text.lower()
     return any(kw in lower for kw in WORKOUT_KEYWORDS)
 
-def build_system_prompt(chat_id):
+def build_system_prompt(chat_id, tracking_update=None):
     profile = user_profiles[chat_id]
+    daily = get_daily(chat_id)
     parts = [SYSTEM_PROMPT]
     context = []
-    if profile["name"]:
+
+    if profile.get("name"):
         context.append(f"Client name: {profile['name']}")
-    if profile["goal"]:
+    if profile.get("goal"):
         context.append(f"Their goal: {profile['goal']}")
-    if profile["workouts"]:
+    if profile.get("workouts"):
         recent = profile["workouts"][-3:]
         context.append(f"Recent workout mentions: {' | '.join(recent)}")
-    if context:
-        parts.append("\n\nWHAT YOU KNOW ABOUT THIS CLIENT:\n" + "\n".join(context))
+
+    cal_remaining = max(0, CALORIE_GOAL - daily["calories"])
+    water_remaining = max(0, WATER_GOAL_ML - daily["water_ml"])
+    context.append(
+        f"Today's tracking — Calories: {daily['calories']}/{CALORIE_GOAL} ({cal_remaining} left) | "
+        f"Water: {daily['water_ml']}ml/{WATER_GOAL_ML}ml ({water_remaining}ml left) | "
+        f"Pills: {'✅' if daily['pills'] else '❌'} | "
+        f"Chlorophyll: {'✅' if daily['chlorophyll'] else '❌'}"
+    )
+    if tracking_update:
+        context.append(f"Just logged this message: {tracking_update}")
+
+    parts.append("\n\nWHAT YOU KNOW ABOUT THIS CLIENT:\n" + "\n".join(context))
     return "\n".join(parts)
 
 def send_telegram(chat_id, text):
@@ -126,6 +302,9 @@ def get_ai_reply(chat_id, user_text):
                 profile["workouts"] = profile["workouts"][-20:]
             save_data()
 
+        # Run tracking detection
+        tracking_update = apply_tracking(chat_id, user_text)
+
         # First message — onboard them
         if not profile["onboarded"] and not history:
             response = client.messages.create(
@@ -146,7 +325,7 @@ def get_ai_reply(chat_id, user_text):
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=200,
-            system=build_system_prompt(chat_id),
+            system=build_system_prompt(chat_id, tracking_update),
             messages=history[-MAX_HISTORY:]
         )
 
@@ -156,7 +335,7 @@ def get_ai_reply(chat_id, user_text):
         if len(history) > MAX_HISTORY:
             conversation_history[chat_id] = history[-MAX_HISTORY:]
 
-        if not profile["name"] or not profile["goal"]:
+        if not profile.get("name") or not profile.get("goal"):
             extract_profile(chat_id, history)
 
         return reply
@@ -166,7 +345,7 @@ def get_ai_reply(chat_id, user_text):
 def extract_profile(chat_id, history):
     try:
         profile = user_profiles[chat_id]
-        if profile["name"] and profile["goal"]:
+        if profile.get("name") and profile.get("goal"):
             return
         transcript = "\n".join(
             f"{m['role'].upper()}: {m['content']}" for m in history[-6:]
@@ -199,15 +378,15 @@ GOAL: <goal or null>"""
     except Exception:
         pass
 
-# --- /stats command ---
+# --- Commands ---
 
 def handle_stats(chat_id):
     profile = user_profiles.get(chat_id, {})
-    name = profile.get("name", "Coach")
+    name = profile.get("name", "")
     goal = profile.get("goal")
     workouts = profile.get("workouts", [])
 
-    lines = [f"📊 YOUR STATS, {name.upper() if name else 'SOLDIER'}"]
+    lines = [f"📊 WORKOUT STATS, {name.upper() if name else 'SOLDIER'}"]
     lines.append("")
     if goal:
         lines.append(f"🎯 Goal: {goal}")
@@ -222,28 +401,30 @@ def handle_stats(chat_id):
 
     send_telegram(chat_id, "\n".join(lines))
 
+def handle_today(chat_id):
+    send_telegram(chat_id, format_daily_summary(chat_id, include_savage_comment=True))
+
 # --- Scheduled messages ---
 
 def send_daily_checkin():
-    if not known_users:
-        return
     for chat_id in list(known_users):
         profile = user_profiles.get(chat_id, {})
         name = profile.get("name", "")
         goal = profile.get("goal", "your goal")
         greeting = f"{name}! " if name else ""
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=80,
-            system="You are a savage drill sergeant gym coach sending a morning check-in text. Be aggressive and motivational. 1-2 sentences max. No emojis.",
-            messages=[{"role": "user", "content": f"Send a morning check-in to my client whose goal is: {goal}. Address them as {greeting}"}]
-        )
-        send_telegram(chat_id, message.content[0].text)
+        try:
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=80,
+                system="You are a savage drill sergeant gym coach sending a morning check-in text. Be aggressive and motivational. 1-2 sentences max. No emojis.",
+                messages=[{"role": "user", "content": f"Send a morning check-in to my client whose goal is: {goal}. Address them as {greeting}"}]
+            )
+            send_telegram(chat_id, message.content[0].text)
+        except Exception as e:
+            print(f"Morning check-in error for {chat_id}: {e}")
 
 def send_gym_reminder():
     days = {0: "Monday", 1: "Tuesday", 3: "Thursday"}
-    # Check current UK day (UTC+0 in winter, UTC+1 in summer — Render runs UTC)
-    import datetime
     weekday = datetime.datetime.utcnow().weekday()
     day_name = days.get(weekday)
     if not day_name:
@@ -255,8 +436,18 @@ def send_gym_reminder():
         text = f"Oi. {name_part}It's {day_name}. Have you been to the gym yet? No excuses."
         send_telegram(chat_id, text)
 
-# Schedule jobs — times are UTC (matches UK/GMT in winter, 1hr off in BST)
+def send_evening_checkin():
+    for chat_id in list(known_users):
+        try:
+            summary = format_daily_summary(chat_id, include_savage_comment=True)
+            send_telegram(chat_id, summary)
+        except Exception as e:
+            print(f"Evening check-in error for {chat_id}: {e}")
+
+# Schedule jobs (UTC — matches UK/GMT in winter, 1hr early in BST)
 schedule.every().day.at("09:00").do(send_daily_checkin)
+schedule.every().day.at("20:00").do(send_evening_checkin)
+schedule.every().day.at("00:00").do(reset_all_daily_stats)
 schedule.every().monday.at("17:00").do(send_gym_reminder)
 schedule.every().tuesday.at("17:00").do(send_gym_reminder)
 schedule.every().thursday.at("17:00").do(send_gym_reminder)
@@ -278,13 +469,14 @@ def handle_update(update):
         if not chat_id or not text:
             return
 
-        # Register user
         if chat_id not in known_users:
             known_users.add(chat_id)
             save_data()
 
         if text == "/stats":
             handle_stats(chat_id)
+        elif text == "/today":
+            handle_today(chat_id)
         elif not text.startswith("/"):
             reply = get_ai_reply(chat_id, text)
             send_telegram(chat_id, reply)
@@ -320,7 +512,6 @@ def poll_telegram():
                         offset = update_id + 1
                         continue
                     _seen_updates.add(update_id)
-                    # Trim set so it doesn't grow forever
                     if len(_seen_updates) > _SEEN_UPDATES_MAX:
                         oldest = sorted(_seen_updates)[:_SEEN_UPDATES_MAX // 2]
                         for uid in oldest:
