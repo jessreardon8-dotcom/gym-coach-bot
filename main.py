@@ -1,23 +1,22 @@
 import os
-import requests
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import anthropic
 from telegram import Update
 from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-HUGGINGFACE_TOKEN = os.environ.get("HUGGINGFACE_TOKEN")
-MODEL_URL = "https://api-inference.huggingface.co/models/google/flan-t5-large"
 
-headers = {"Authorization": f"Bearer {HUGGINGFACE_TOKEN}"}
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 def get_ai_reply(user_text):
-    payload = {"inputs": f"You are a savage but supportive gym coach. Reply like a real text message. User says: {user_text}"}
-    response = requests.post(MODEL_URL, headers=headers, json=payload).json()
-    try:
-        return response[0]["generated_text"]
-    except:
-        return "hmm... something went wrong. try again."
+    response = client.messages.create(
+        model="claude-opus-4-6",
+        max_tokens=256,
+        system="You are a savage but supportive gym coach. Reply like a real text message — short, punchy, no fluff. Keep it under 3 sentences.",
+        messages=[{"role": "user", "content": user_text}]
+    )
+    return response.content[0].text
 
 def handle_message(update: Update, context: CallbackContext):
     user_text = update.message.text
