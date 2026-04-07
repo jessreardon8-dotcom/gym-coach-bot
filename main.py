@@ -292,6 +292,8 @@ def handle_update(update):
         print(f"Error handling update: {e}")
 
 _polling_lock = threading.Lock()
+_seen_updates = set()
+_SEEN_UPDATES_MAX = 1000
 
 def poll_telegram():
     if not _polling_lock.acquire(blocking=False):
@@ -313,8 +315,18 @@ def poll_telegram():
                 )
                 data = response.json()
                 for update in data.get("result", []):
+                    update_id = update["update_id"]
+                    if update_id in _seen_updates:
+                        offset = update_id + 1
+                        continue
+                    _seen_updates.add(update_id)
+                    # Trim set so it doesn't grow forever
+                    if len(_seen_updates) > _SEEN_UPDATES_MAX:
+                        oldest = sorted(_seen_updates)[:_SEEN_UPDATES_MAX // 2]
+                        for uid in oldest:
+                            _seen_updates.discard(uid)
                     handle_update(update)
-                    offset = update["update_id"] + 1
+                    offset = update_id + 1
             except Exception as e:
                 print(f"Polling error: {e}")
                 time.sleep(5)
